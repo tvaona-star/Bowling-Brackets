@@ -377,7 +377,7 @@
 
 // ---------- Firebase ----------
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-app.js";
-import { getDatabase, ref, set, get, update, onValue } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-database.js";
+import { getDatabase, ref, set, get, update, onValue, increment } from "https://www.gstatic.com/firebasejs/12.13.0/firebase-database.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAvg9bSEVVBHHCOKRqJ1MrNjvJlXsyfXV0",
@@ -393,6 +393,26 @@ const firebaseApp = initializeApp(firebaseConfig);
 const db = getDatabase(firebaseApp);
 const stateRef = ref(db, "bbsp/state");
 const connectedRef = ref(db, ".info/connected");
+
+// ---------- Usage metrics ----------
+// Bowler-view visits are logged to bbsp/metrics/bowlerViews (separate from
+// bbsp/state so they never ride along with state saves/restores):
+//   { "YYYY-MM-DD": <count>, ..., "total": <count> }
+// One log per browser tab session — refreshes and tab-hops don't re-count.
+function localDayKey(d) {
+  return d.getFullYear() + "-" +
+    String(d.getMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getDate()).padStart(2, "0");
+}
+
+function logBowlerView() {
+  if (sessionStorage.getItem("bbsp_bvLogged")) return; // once per tab session
+  sessionStorage.setItem("bbsp_bvLogged", "1");
+  update(ref(db, "bbsp/metrics/bowlerViews"), {
+    [localDayKey(new Date())]: increment(1),
+    total: increment(1)
+  }).catch(err => console.error("Metrics write failed:", err));
+}
 
 // ---------- Offline / local cache ----------
 const LOCAL_CACHE_KEY  = "bbsp_cache";    // last known good state
@@ -601,6 +621,7 @@ let state = { events: {}, adminPassword: "" };
 // viewMode is per-tab: sessionStorage keeps it isolated to this browser tab.
 // If sessionStorage has no value (fresh tab), fall back to "admin".
 state.viewMode = sessionStorage.getItem(VM_KEY) || "bowler";
+if (state.viewMode === "bowler") logBowlerView();
 
 // ---------- Event model ----------
 function newEvent(data) {
@@ -1479,6 +1500,11 @@ function aliveListData(event) {
             status = "alive"; currentRound = 3;
             opponents = (r3m?.bowlers || []).filter(x => x !== bid).map(oppObj);
           } else {
+            // Game 3 resolved — always reflect the Game 3 opponent (the bowler
+            // advanced through Game 2, so `opponents` still held the Game 1
+            // matchup). Set it here so winners AND eliminated entries show the
+            // current/final-game opponent, never reverting to Game 1.
+            opponents = (r3m.bowlers || []).filter(x => x !== bid).map(oppObj);
             if (r3m.firsts && r3m.firsts.includes(bid)) {
               status = "winner";
               finalPosition = r3m.firsts.length > 1 ? "Tied 1st" : "1st place";
@@ -1487,7 +1513,6 @@ function aliveListData(event) {
               finalPosition = r3m.seconds.length > 1 ? "Tied 2nd" : "2nd place";
             } else {
               status = "eliminated"; eliminatedRound = 3;
-              opponents = (r3m.bowlers || []).filter(x => x !== bid).map(oppObj);
             }
           }
         }
@@ -2044,6 +2069,7 @@ function setHeader(title, back, eventId, activeTab) {
       { label: "Results",   href: `#event/${eventId}/results`,   id: "results",   on: canFinal || gamesSubmitted },
       { label: "Payouts",   href: `#event/${eventId}/payouts`,   id: "payouts",   on: canFinal || hasUnpaidLedger || gamesSubmitted },
       ...(isLeague ? [{ label: "History", href: `#event/${eventId}/history`, id: "history", on: true }] : []),
+      { label: "Usage", href: `#event/${eventId}/usage`, id: "usage", on: true },
     ];
     eventSubnav.style.display = "flex";
     eventSubnav.innerHTML = tabs.map(t =>
@@ -4694,6 +4720,140 @@ function renderResults(eventId) {
   document.getElementById("print-results-btn")?.addEventListener("click", () => printAliveSnapshot(eventId));
 }
 
+// ---------- Usage dashboard (admin) ----------
+// Reads bbsp/metrics/bowlerViews (written by logBowlerView) and charts
+// visits over a scrollable window. View modes: day / week / month / year.
+let usageMode = "week";   // current view mode
+let usageAnchor = null;   // Date — last day of the visible window
+let usageData = null;     // cached bowlerViews snapshot for this visit
+
+function usageSeries() {
+  // Build [{label, count}] for the current mode/anchor.
+  const data = usageData || {};
+  const out = [];
+  const a = new Date(usageAnchor.getFullYear(), usageAnchor.getMonth(), usageAnchor.getDate());
+  if (usageMode === "year") {
+    // 12 monthly totals ending at the anchor's month
+    for (let i = 11; i >= 0; i--) {
+      const m = new Date(a.getFullYear(), a.getMonth() - i, 1);
+      const prefix = m.getFullYear() + "-" + String(m.getMonth() + 1).padStart(2, "0");
+      let sum = 0;
+      Object.keys(data).forEach(k => { if (k.startsWith(prefix)) sum += Number(data[k]) || 0; });
+      out.push({ label: m.toLocaleDateString(undefined, { month: "short", year: "2-digit" }), count: sum });
+    }
+  } else {
+    const days = usageMode === "day" ? 1 : usageMode === "week" ? 7 : 30;
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(a.getFullYear(), a.getMonth(), a.getDate() - i);
+      out.push({ label: (d.getMonth() + 1) + "/" + d.getDate(), count: Number(data[localDayKey(d)]) || 0 });
+    }
+  }
+  return out;
+}
+
+function usageChartSVG(series) {
+  const W = 640, H = 260, padL = 46, padR = 16, padT = 16, padB = 38;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const max = Math.max(1, ...series.map(p => p.count));
+  const x = i => series.length === 1 ? padL + iw / 2 : padL + (i * iw) / (series.length - 1);
+  const y = v => padT + ih - (v / max) * ih;
+  let grid = "", labels = "";
+  const yTicks = Math.min(4, max);
+  for (let t = 0; t <= yTicks; t++) {
+    const v = (max * t) / yTicks;
+    const yy = y(v);
+    grid += `<line x1="${padL}" y1="${yy}" x2="${W - padR}" y2="${yy}" stroke="var(--grey-300)" stroke-width="1"/>`;
+    labels += `<text x="${padL - 8}" y="${yy + 4}" text-anchor="end" font-size="11" fill="var(--grey-700)">${Math.round(v)}</text>`;
+  }
+  const step = Math.ceil(series.length / 10); // thin x labels so they don't overlap
+  series.forEach((p, i) => {
+    if (i % step !== 0 && i !== series.length - 1) return;
+    labels += `<text x="${x(i)}" y="${H - padB + 18}" text-anchor="middle" font-size="11" fill="var(--grey-700)">${p.label}</text>`;
+  });
+  const pts = series.map((p, i) => `${x(i)},${y(p.count)}`).join(" ");
+  const dots = series.map((p, i) =>
+    `<circle cx="${x(i)}" cy="${y(p.count)}" r="3.5" fill="var(--blue)"><title>${p.label}: ${p.count}</title></circle>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" aria-label="Bowler view visits">
+    ${grid}
+    <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${H - padB}" stroke="var(--grey-500)"/>
+    <line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="var(--grey-500)"/>
+    ${series.length > 1 ? `<polyline points="${pts}" fill="none" stroke="var(--blue)" stroke-width="2"/>` : ""}
+    ${dots}
+    ${labels}
+    <text x="13" y="${padT + ih / 2}" font-size="11" fill="var(--grey-700)" text-anchor="middle" transform="rotate(-90 13 ${padT + ih / 2})">Visits</text>
+  </svg>`;
+}
+
+function renderUsage(eventId) {
+  const e = getEvent(eventId);
+  if (!e) { go("home"); return; }
+  setHeader("Usage", "event/" + eventId, eventId, "usage");
+  if (!usageAnchor) usageAnchor = new Date();
+  main.innerHTML = `<div class="empty"><p class="muted">Loading usage data…</p></div>`;
+  get(ref(db, "bbsp/metrics/bowlerViews")).then(snap => {
+    usageData = snap.val() || {};
+    drawUsage(eventId);
+  }).catch(err => {
+    main.innerHTML = `<div class="empty"><h3>Couldn't load usage data</h3><p class="muted">${escapeHtml(String(err))}</p></div>`;
+  });
+}
+
+function drawUsage(eventId) {
+  const total = Number((usageData || {}).total) || 0;
+  const series = usageSeries();
+  const windowTotal = series.reduce((s, p) => s + p.count, 0);
+  const rangeLabel = series.length === 1 ? series[0].label
+    : series[0].label + " – " + series[series.length - 1].label;
+  const modes = ["day", "week", "month", "year"];
+  const stepLabel = usageMode === "month" ? "one month" : usageMode === "year" ? "one year" : "one day";
+  main.innerHTML = `
+    <div class="card" style="margin-bottom:8px;padding:12px 16px">
+      <div class="row between" style="flex-wrap:wrap;gap:16px">
+        <div>
+          <div class="muted" style="font-size:12px">Total Bowler View Visits (all time)</div>
+          <div style="font-size:28px;font-weight:700;color:var(--navy)">${total}</div>
+        </div>
+        <div>
+          <div class="muted" style="font-size:12px">Visits shown (${rangeLabel})</div>
+          <div style="font-size:28px;font-weight:700;color:var(--navy)">${windowTotal}</div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="padding:12px 16px">
+      <div class="row between" style="flex-wrap:wrap;gap:8px;margin-bottom:10px">
+        <div style="display:flex;gap:6px">
+          ${modes.map(m =>
+            `<button class="btn small${usageMode === m ? "" : " secondary"}" data-usage-mode="${m}">${m[0].toUpperCase() + m.slice(1)}</button>`
+          ).join("")}
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="btn small secondary" id="usage-back" title="Back ${stepLabel}">◀</button>
+          <span class="muted" style="font-size:13px;min-width:90px;text-align:center">${rangeLabel}</span>
+          <button class="btn small secondary" id="usage-fwd" title="Forward ${stepLabel}">▶</button>
+        </div>
+      </div>
+      ${usageChartSVG(series)}
+      <p class="muted" style="font-size:12px;margin-top:8px">
+        One visit = one browser session opening Bowler View. ◀ ▶ move ${stepLabel} at a time.
+      </p>
+    </div>`;
+  main.querySelectorAll("[data-usage-mode]").forEach(b =>
+    b.addEventListener("click", () => { usageMode = b.dataset.usageMode; drawUsage(eventId); }));
+  const shift = dir => {
+    const a = usageAnchor;
+    let next;
+    if (usageMode === "month")      next = new Date(a.getFullYear(), a.getMonth() + dir, a.getDate());
+    else if (usageMode === "year")  next = new Date(a.getFullYear() + dir, a.getMonth(), a.getDate());
+    else                            next = new Date(a.getFullYear(), a.getMonth(), a.getDate() + dir);
+    const today = new Date();
+    if (next > today) next = today; // can't scroll into the future
+    usageAnchor = next;
+    drawUsage(eventId);
+  };
+  document.getElementById("usage-back").addEventListener("click", () => shift(-1));
+  document.getElementById("usage-fwd").addEventListener("click", () => shift(1));
+}
+
 function render() {
   const r = getRoute();
 
@@ -4720,6 +4880,7 @@ function render() {
   if (r.name === "import") return renderImport(r.eventId);
   if (r.name === "settings") return renderEditSettings(r.eventId);
   if (r.name === "history") return renderLeagueHistory(r.eventId);
+  if (r.name === "usage") return renderUsage(r.eventId);
   go("home");
 }
 
@@ -4820,6 +4981,7 @@ onValue(stateRef, (snapshot) => {
 btnBowler.addEventListener("click", () => {
   if (state.viewMode === "bowler") return;
   state.viewMode = "bowler";
+  logBowlerView();
   sessionStorage.setItem(VM_KEY, "bowler");
   location.hash = "";
   render();

@@ -3434,9 +3434,14 @@ function renderEntryTotals(e, t) {
       <div class="sub">${t.totalScratchSidepot}sg · ${t.totalHandicapSidepot}hg · ${t.totalScratchHS}ss · ${t.totalHandicapHS}hs</div>
     </div>
     <div class="summary-card">
-      <div class="label">Prize Pool Generated</div>
-      <div class="value green">${fmtMoney(t.totalPrizePoolGenerated)}</div>
+      <div class="label">Brackets Prize Pool</div>
+      <div class="value green">${fmtMoney(t.bracketPrizeRevenue)}</div>
       <div class="sub">paid entries · house cut ${fmtMoney(t.houseCutTotal)}</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">Sidepots Prize Pool</div>
+      <div class="value green">${fmtMoney(t.sidepotRevenue)}</div>
+      <div class="sub">paid entries · incl. high series</div>
     </div>
   </div>${bracketFillHtml}</div>`;
 }

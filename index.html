@@ -3204,6 +3204,16 @@ function renderEvent(eventId) {
   if (e.status === "finalized" && e.eventType === "league") {
     overviewActions += `<button class="btn secondary" id="start-week-btn" style="border-color:var(--green);color:var(--green)">↺ Start Next Week</button>`;
   }
+  // Escape hatch: once brackets are formed or scoring has begun, the Add/entry
+  // controls disappear. Let the admin drop back to "open" to add a late bracket
+  // or sidepot without losing any scores or brackets already entered.
+  if (e.status === "ready" || e.status === "scoring") {
+    overviewActions += `<button class="btn secondary" id="reopen-entries-btn" style="border-color:var(--amber);color:var(--amber)">↩ Reopen for Entries</button>`;
+  }
+  // After reopening, jump back into scoring without re-forming brackets.
+  if (e.status === "open" && Object.keys(e.bracketPools || {}).length > 0) {
+    overviewActions += `<button class="btn primary" id="resume-scoring-btn">Resume Scoring &#8594;</button>`;
+  }
   if (overviewActions) html += `<div class="btn-row">${overviewActions}</div>`;
   html += `</div>`;
 
@@ -3383,6 +3393,30 @@ function renderEvent(eventId) {
       resetLeagueWeek(eventId);
       go("event/" + eventId);
     }
+  });
+
+  // Reopen for Entries — revert status to "open" without wiping scores/brackets
+  const reBtn = document.getElementById("reopen-entries-btn");
+  if (reBtn) reBtn.addEventListener("click", () => {
+    const anyScores = Object.values(e.scores || {}).some(s => s && Object.keys(s).length > 0);
+    let msg = "Reopen this session for entries?\n\nThe event returns to the Open state so you can add or edit bowlers, brackets, and sidepots. Any scores and brackets already entered are kept — use “Resume Scoring” to continue afterward.";
+    if (anyScores) {
+      msg += "\n\n⚠ Scores have already been entered. Adding a sidepot entry is safe. If you RE-FORM brackets after adding a bracket entry, the existing bracket results will change.";
+    }
+    if (confirm(msg)) {
+      e.status = "open";
+      saveState();
+      go("event/" + eventId);
+    }
+  });
+
+  // Resume Scoring — return to scoring after reopening, no re-form needed
+  const resBtn = document.getElementById("resume-scoring-btn");
+  if (resBtn) resBtn.addEventListener("click", () => {
+    e.status = "scoring";
+    if (!e.currentGame || e.currentGame < 1) e.currentGame = 1;
+    saveState();
+    go("event/" + eventId + "/scoring");
   });
 }
 
@@ -3800,8 +3834,12 @@ function renderScoring(eventId) {
   setHeader("Score Entry", "event/" + eventId, eventId, "scoring");
 
   // Ensure status reflects scoring in progress — handles direct URL navigation
-  // and cross-tab cases where status wasn't advanced through the button
-  if (e.status === "ready" || e.status === "open") {
+  // and cross-tab cases where status wasn't advanced through the button.
+  // NEVER silently advance an "open" event just because the scoring screen was
+  // opened — that used to lock admins out of adding late brackets/sidepots with
+  // no way back. An "open" event is sent to the overview to form brackets first.
+  if (e.status === "open") { go("event/" + eventId); return; }
+  if (e.status === "ready") {
     e.status = "scoring";
     saveState();
   }
@@ -4338,6 +4376,43 @@ function renderPayouts(eventId) {
   });
 }
 
+// Delete a finalized (archived) week from history. Removes its snapshot and
+// ledger rows, then renumbers later weeks down by one so the week count stays
+// contiguous — currentWeekNum is derived from weekHistory.length, so a gap
+// would otherwise collide the live week with an archived one.
+function deleteWeekFromHistory(eventId, weekNum) {
+  const e = getEvent(eventId);
+  if (!e) return;
+
+  e.weekHistory = (e.weekHistory || []).filter(w => w.weekNum !== weekNum);
+  e.ledger      = (e.ledger || []).filter(l => l.weekNum !== weekNum);
+
+  // Shift every later week down by one
+  e.weekHistory.forEach(w => { if (w.weekNum > weekNum) w.weekNum -= 1; });
+  e.ledger.forEach(l => { if (l.weekNum > weekNum) l.weekNum -= 1; });
+
+  // Removing a week from the timeline pulls the current session date back 7 days.
+  // Do this BEFORE rebuilding labels so the live week's label uses the corrected date.
+  if (e.date) {
+    const d = new Date(e.date + "T12:00:00");
+    d.setDate(d.getDate() - 7);
+    e.date = d.toISOString().slice(0, 10);
+  }
+
+  // Rebuild each surviving ledger row's key + label from its corrected week
+  const dateForWeek = wn => {
+    const wk = (e.weekHistory || []).find(w => w.weekNum === wn);
+    return wk ? (wk.date || "") : (e.date || "");
+  };
+  (e.ledger || []).forEach(l => {
+    l.weekLabel = weekLabelFor(e, l.weekNum, dateForWeek(l.weekNum));
+    l.key = ledgerKey(l.weekNum, l.bowlerId, l.label);
+  });
+  dedupeKeys(e.ledger || []);
+
+  saveEvent(eventId);
+}
+
 function renderLeagueHistory(eventId) {
   const e = getEvent(eventId);
   if (!e || e.eventType !== "league") { go("event/" + eventId); return; }
@@ -4396,6 +4471,10 @@ function renderLeagueHistory(eventId) {
   });
   const weekList = Object.values(weeks).sort((a, b) => b.weekNum - a.weekNum);
 
+  // Only finalized (archived) weeks can be deleted — the current live week is
+  // managed via Reopen/Start Next Week, not the history tab.
+  const archivedWeeks = new Set((e.weekHistory || []).map(w => w.weekNum));
+
   if (weekList.length === 0) {
     main.innerHTML = `<div class="card"><div class="empty">
       <h3>No History Yet</h3>
@@ -4444,10 +4523,14 @@ function renderLeagueHistory(eventId) {
       ...weekRefunds.map(r => r.bowlerId)
     ])];
 
+    const isArchived = archivedWeeks.has(wk.weekNum);
     let wkHtml = `<div class="card">
       <div class="row between mb-1">
         <h3 class="mt-0" style="color:var(--navy)">${escapeHtml(wk.weekLabel)}</h3>
-        <span style="font-size:13px;font-weight:700;color:var(--green)">${fmtMoney(weekTotal + weekRefundTotal)}</span>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:13px;font-weight:700;color:var(--green)">${fmtMoney(weekTotal + weekRefundTotal)}</span>
+          ${isArchived ? `<button class="btn small danger delete-week-btn" data-week="${wk.weekNum}" data-label="${escapeHtml(wk.weekLabel)}" style="padding:4px 8px;min-height:28px;font-size:12px">🗑 Delete Week</button>` : ""}
+        </div>
       </div>`;
 
     if (ids.length === 0) {
@@ -4488,6 +4571,19 @@ function renderLeagueHistory(eventId) {
   let html = (weekHtmlList[0] || "") + weekHtmlList.slice(1).join("");
 
   main.innerHTML = html;
+
+  // Delete Week — remove an incorrect finalized week and renumber the rest
+  document.querySelectorAll(".delete-week-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const wn = Number(btn.dataset.week);
+      const label = btn.dataset.label || ("Week " + wn);
+      const msg = `Delete "${label}" from history?\n\nThis permanently removes that week's recorded payouts and renumbers the remaining weeks so your week count is correct. The current session date shifts back 7 days to stay aligned.\n\nThis cannot be undone.`;
+      if (confirm(msg)) {
+        deleteWeekFromHistory(eventId, wn);
+        render();
+      }
+    });
+  });
 }
 
 
